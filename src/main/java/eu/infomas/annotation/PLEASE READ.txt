@@ -1,0 +1,4 @@
+No files in this package belong to me...
+https://github.com/rmuller/infomas-asl
+
+This package will be removed when the maven repository has been updated.
