@@ -21,11 +21,9 @@
  */
 package eu.infomas.annotation;
 
-import java.io.DataInput;
-import java.io.File;
-import java.io.FilenameFilter;
-import java.io.IOException;
-import java.io.InputStream;
+import org.apache.logging.log4j.LogManager;
+
+import java.io.*;
 import java.lang.annotation.Annotation;
 import java.lang.annotation.ElementType;
 import java.lang.reflect.AnnotatedElement;
@@ -35,16 +33,7 @@ import java.lang.reflect.Method;
 import java.net.JarURLConnection;
 import java.net.URISyntaxException;
 import java.net.URL;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.EnumSet;
-import java.util.Enumeration;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -116,6 +105,8 @@ import java.util.logging.Logger;
  * @since annotation-detector 3.0.0
  */
 public final class AnnotationDetector implements Builder, Cursor {
+
+    private static final org.apache.logging.log4j.Logger logger = LogManager.getLogger("AnnotationDetector");
 
     private static final Logger LOG = Logger.getLogger(AnnotationDetector.class.getName());
 
@@ -191,7 +182,7 @@ public final class AnnotationDetector implements Builder, Cursor {
             LOG.warning("No files or directories to scan!");
         } else if (LOG.isLoggable(Level.FINE)) {
             LOG.log(Level.FINE, "Files and root directories scanned:\n{0}",
-                Arrays.toString(filesOrDirectories).replace(", ", "\n"));
+                    Arrays.toString(filesOrDirectories).replace(", ", "\n"));
         }
     }
 
@@ -201,7 +192,7 @@ public final class AnnotationDetector implements Builder, Cursor {
      * on the class path are scanned.
      */
     public static Builder scanClassPath(final String... packageNames)
-        throws IOException {
+            throws IOException {
 
         final ClassLoader loader = Thread.currentThread().getContextClassLoader();
 
@@ -214,16 +205,16 @@ public final class AnnotationDetector implements Builder, Cursor {
      * on the class path are scanned.
      */
     public static Builder scanClassPath(ClassLoader loader, final String... packageNames)
-        throws IOException {
+            throws IOException {
 
-        final Set<File> files = new HashSet<File>();
+        final Set<File> files = new HashSet<>();
         final String[] pkgNameFilter;
         if (packageNames.length == 0) {
             pkgNameFilter = null;
             final String[] fileNames = System.getProperty("java.class.path")
-                .split(File.pathSeparator);
-            for (int i = 0; i < fileNames.length; ++i) {
-                files.add(new File(fileNames[i]));
+                    .split(File.pathSeparator);
+            for (String fileName : fileNames) {
+                files.add(new File(fileName));
             }
         } else {
             pkgNameFilter = new String[packageNames.length];
@@ -248,15 +239,95 @@ public final class AnnotationDetector implements Builder, Cursor {
         return new AnnotationDetector(filesOrDirectories, null);
     }
 
+    private static void addFiles(ClassLoader loader, String resourceName, Set<File> files)
+            throws IOException {
+
+        final Enumeration<URL> resourceEnum = loader.getResources(resourceName);
+        while (resourceEnum.hasMoreElements()) {
+            final URL url = resourceEnum.nextElement();
+            LOG.log(Level.FINER, "Resource URL: {0}", url);
+            // Handle JBoss VFS URL's which look like (example package 'nl.dvelop'):
+            // vfs:/foo/bar/website.war/WEB-INF/classes/nl/dvelop/
+            // vfs:/foo/bar/website.war/WEB-INF/lib/dwebcore-0.0.1.jar/nl/dvelop/
+            final boolean isVfs = "vfs".equals(url.getProtocol());
+            if ("file".equals(url.getProtocol()) || isVfs) {
+                final File dir = toFile(url);
+                if (dir.isDirectory()) {
+                    files.add(dir);
+                } else if (isVfs) {
+                    //Jar file via JBoss VFS protocol - strip package name
+                    String jarPath = dir.getPath();
+                    final int idx = jarPath.indexOf(".jar");
+                    if (idx > -1) {
+                        jarPath = jarPath.substring(0, idx + 4);
+                        final File jarFile = new File(jarPath);
+                        if (jarFile.isFile()) {
+                            files.add(jarFile);
+                        }
+                    }
+                } else {
+                    throw assertionError("Not a recognized file URL: %s", url);
+                }
+            } else {
+                // Resource in Jar File
+                final File jarFile =
+                        toFile(((JarURLConnection) url.openConnection()).getJarFileURL());
+                if (jarFile.isFile()) {
+                    files.add(jarFile);
+                } else {
+                    throw assertionError("Not a File: %s", jarFile);
+                }
+            }
+        }
+    }
+
+    private static File toFile(final URL url) throws IOException {
+        // only correct way to convert the URL to a File object, also see issue #16
+        // Do not use URLDecoder
+        try {
+            return new File(url.toURI());
+        } catch (URISyntaxException ex) {
+            throw new IOException(ex.getMessage());
+        }
+    }
+
+    /**
+     * Load the class, but do not initialize it.
+     */
+    private static Class<?> loadClass(ClassLoader loader, final String rawClassName) {
+        final String typeName = rawClassName.replace('/', '.');
+        try {
+            logger.debug("\t{}", typeName);
+
+            return Class.forName(typeName, false, loader);
+        } catch (ClassNotFoundException ex) {
+            throw assertionError(
+                    "Cannot load type '%s', scanned file not on class path? (%s)", typeName, ex);
+        }
+    }
+
+    /**
+     * The method descriptor must always be parseable, so if not an AssertionError is thrown.
+     */
+    private static AssertionError unparseable(final String descriptor, final String cause) {
+        return assertionError(
+                "Unparseble method descriptor: '%s' (cause: %s)", descriptor, cause);
+    }
+
+    private static AssertionError assertionError(String message, Object... args) {
+        return new AssertionError(String.format(message, args));
+    }
+
     /**
      * See {@link Builder#forAnnotations(Class...) }.
      */
+    @SafeVarargs
     @Override
-    public Builder forAnnotations(final Class<? extends Annotation>... a) {
-        annotations = new HashMap<String, Class<? extends Annotation>>(a.length);
+    public final Builder forAnnotations(final Class<? extends Annotation>... a) {
+        annotations = new HashMap<>(a.length);
         // map "raw" type names to Class object
-        for (int i = 0; i < a.length; ++i) {
-            annotations.put("L" + a[i].getName().replace('.', '/') + ";", a[i]);
+        for (Class<? extends Annotation> anA : a) {
+            annotations.put("L" + anA.getName().replace('.', '/') + ";", anA);
         }
         return this;
     }
@@ -297,29 +368,16 @@ public final class AnnotationDetector implements Builder, Cursor {
         return this;
     }
 
-    /**
-     * See {@link Builder#report(AnnotationDetector.Reporter) }.
-     */
     @Override
     public void report(final Reporter reporter) throws IOException {
         this.reporter = reporter;
         detect(cfIterator);
     }
 
-    /**
-     * See {@link Builder#collect(AnnotationDetector.ReporterFunction) }.
-     */
     @Override
     public <T> List<T> collect(final ReporterFunction<T> reporter) throws IOException {
-        final List<T> list = new ArrayList<T>();
-        this.reporter = new Reporter() {
-
-            @Override
-            public void report(Cursor cursor) {
-                list.add(reporter.report(cursor));
-            }
-
-        };
+        final List<T> list = new ArrayList<>();
+        this.reporter = cursor -> list.add(reporter.report(cursor));
         detect(cfIterator);
         return list;
     }
@@ -356,6 +414,8 @@ public final class AnnotationDetector implements Builder, Cursor {
         return memberName;
     }
 
+    // private
+
     /**
      * See {@link Cursor#getType() }.
      */
@@ -371,13 +431,13 @@ public final class AnnotationDetector implements Builder, Cursor {
     public Field getField() {
         if (elementType != ElementType.FIELD) {
             throw new IllegalStateException(
-                "Illegal to call getField() when " + elementType + " is reported");
+                    "Illegal to call getField() when " + elementType + " is reported");
         }
         try {
             return getType().getDeclaredField(memberName);
         } catch (NoSuchFieldException ex) {
             throw assertionError(
-                "Cannot find Field '%s' for type %s", memberName, getTypeName());
+                    "Cannot find Field '%s' for type %s", memberName, getTypeName());
         }
     }
 
@@ -388,14 +448,14 @@ public final class AnnotationDetector implements Builder, Cursor {
     public Constructor getConstructor() {
         if (elementType != ElementType.CONSTRUCTOR) {
             throw new IllegalStateException(
-                "Illegal to call getMethod() when " + elementType + " is reported");
+                    "Illegal to call getMethod() when " + elementType + " is reported");
         }
         try {
             final Class<?>[] parameterTypes = parseArguments(methodDescriptor);
             return getType().getConstructor(parameterTypes);
         } catch (NoSuchMethodException ex) {
             throw assertionError(
-                "Cannot find Contructor '%s(...)' for type %s", memberName, getTypeName());
+                    "Cannot find Contructor '%s(...)' for type %s", memberName, getTypeName());
         }
     }
 
@@ -406,14 +466,14 @@ public final class AnnotationDetector implements Builder, Cursor {
     public Method getMethod() {
         if (elementType != ElementType.METHOD) {
             throw new IllegalStateException(
-                "Illegal to call getMethod() when " + elementType + " is reported");
+                    "Illegal to call getMethod() when " + elementType + " is reported");
         }
         try {
             final Class<?>[] parameterTypes = parseArguments(methodDescriptor);
             return getType().getDeclaredMethod(memberName, parameterTypes);
         } catch (NoSuchMethodException ex) {
             throw assertionError(
-                "Cannot find Method '%s(...)' for type %s", memberName, getTypeName());
+                    "Cannot find Method '%s(...)' for type %s", memberName, getTypeName());
         }
     }
 
@@ -424,7 +484,7 @@ public final class AnnotationDetector implements Builder, Cursor {
     public <T extends Annotation> T getAnnotation(final Class<T> annotationClass) {
         if (!annotationClass.equals(annotationType)) {
             throw new IllegalStateException("Illegal to call getAnnotation() when " +
-                this.annotationType.getName() + " is reported");
+                    this.annotationType.getName() + " is reported");
         }
         final AnnotatedElement ae;
         switch (elementType) {
@@ -441,60 +501,6 @@ public final class AnnotationDetector implements Builder, Cursor {
                 throw new AssertionError(elementType);
         }
         return ae.getAnnotation(annotationClass);
-    }
-
-    // private
-
-    private static void addFiles(ClassLoader loader, String resourceName, Set<File> files)
-        throws IOException {
-
-        final Enumeration<URL> resourceEnum = loader.getResources(resourceName);
-        while (resourceEnum.hasMoreElements()) {
-            final URL url = resourceEnum.nextElement();
-            LOG.log(Level.FINER, "Resource URL: {0}", url);
-            // Handle JBoss VFS URL's which look like (example package 'nl.dvelop'):
-            // vfs:/foo/bar/website.war/WEB-INF/classes/nl/dvelop/
-            // vfs:/foo/bar/website.war/WEB-INF/lib/dwebcore-0.0.1.jar/nl/dvelop/
-            final boolean isVfs = "vfs".equals(url.getProtocol());
-            if ("file".equals(url.getProtocol()) || isVfs) {
-                final File dir = toFile(url);
-                if (dir.isDirectory()) {
-                    files.add(dir);
-                } else if (isVfs) {
-                    //Jar file via JBoss VFS protocol - strip package name
-                    String jarPath = dir.getPath();
-                    final int idx = jarPath.indexOf(".jar");
-                    if (idx > -1) {
-                        jarPath = jarPath.substring(0, idx + 4);
-                        final File jarFile = new File(jarPath);
-                        if (jarFile.isFile()) {
-                            files.add(jarFile);
-                        }
-                    }
-                } else {
-                    throw assertionError("Not a recognized file URL: %s", url);
-                }
-            } else {
-                // Resource in Jar File
-                final File jarFile =
-                    toFile(((JarURLConnection)url.openConnection()).getJarFileURL());
-                if (jarFile.isFile()) {
-                    files.add(jarFile);
-                } else {
-                    throw assertionError("Not a File: %s", jarFile);
-                }
-            }
-        }
-    }
-
-    private static File toFile(final URL url) throws IOException {
-        // only correct way to convert the URL to a File object, also see issue #16
-        // Do not use URLDecoder
-        try {
-            return new File(url.toURI());
-        } catch (URISyntaxException ex) {
-            throw new IOException(ex.getMessage());
-        }
     }
 
     @SuppressWarnings("illegalcatch")
@@ -524,7 +530,7 @@ public final class AnnotationDetector implements Builder, Cursor {
     }
 
     private boolean hasCafebabe(final ClassFileBuffer buffer) throws IOException {
-        return buffer.size() > 4 &&  buffer.readInt() == 0xCAFEBABE;
+        return buffer.size() > 4 && buffer.readInt() == 0xCAFEBABE;
     }
 
     /**
@@ -546,7 +552,7 @@ public final class AnnotationDetector implements Builder, Cursor {
         // sequence: minor version, major version (argument_index is 1-based)
         if (LOG.isLoggable(Level.FINER)) {
             LOG.log(Level.FINER, "Java Class version {1}.{0}",
-                new Object[]{di.readUnsignedShort(), di.readUnsignedShort()});
+                    new Object[]{di.readUnsignedShort(), di.readUnsignedShort()});
         } else {
             di.skipBytes(4);
         }
@@ -567,7 +573,7 @@ public final class AnnotationDetector implements Builder, Cursor {
      * Return {@code true} if a double slot is read (in case of Double or Long constant).
      */
     private boolean readConstantPoolEntry(final DataInput di, final int index)
-        throws IOException {
+            throws IOException {
 
         final int tag = di.readUnsignedByte();
         switch (tag) {
@@ -600,7 +606,7 @@ public final class AnnotationDetector implements Builder, Cursor {
                 return false;
             default:
                 throw new ClassFormatError(
-                    "Unkown tag value for constant pool entry: " + tag);
+                        "Unkown tag value for constant pool entry: " + tag);
         }
     }
 
@@ -646,7 +652,7 @@ public final class AnnotationDetector implements Builder, Cursor {
     }
 
     private void readAttributes(final DataInput di, final ElementType reporterType)
-        throws IOException {
+            throws IOException {
 
         final int count = di.readUnsignedShort();
         for (int i = 0; i < count; ++i) {
@@ -654,8 +660,8 @@ public final class AnnotationDetector implements Builder, Cursor {
             // in bytes, use this to skip the attribute info block
             final int length = di.readInt();
             if (elementTypes.contains(reporterType) &&
-                ("RuntimeVisibleAnnotations".equals(name) ||
-                "RuntimeInvisibleAnnotations".equals(name))) {
+                    ("RuntimeVisibleAnnotations".equals(name) ||
+                            "RuntimeInvisibleAnnotations".equals(name))) {
                 LOG.log(Level.FINEST, "Attribute: {0}", name);
                 readAnnotations(di, reporterType);
             } else {
@@ -666,7 +672,7 @@ public final class AnnotationDetector implements Builder, Cursor {
     }
 
     private void readAnnotations(final DataInput di, final ElementType elementType)
-        throws IOException {
+            throws IOException {
 
         // the number of Runtime(In)VisibleAnnotations
         final int count = di.readUnsignedShort();
@@ -678,8 +684,8 @@ public final class AnnotationDetector implements Builder, Cursor {
                 continue;
             }
             LOG.log(Level.FINE,
-                "Annotation: ''{0}'' on type ''{1}'', member ''{2}'' (reported)",
-                new Object[]{annotationType.getName(), getTypeName(), getMemberName()});
+                    "Annotation: ''{0}'' on type ''{1}'', member ''{2}'' (reported)",
+                    new Object[]{annotationType.getName(), getTypeName(), getMemberName()});
             this.elementType = elementType;
             reporter.report(this);
         }
@@ -731,7 +737,7 @@ public final class AnnotationDetector implements Builder, Cursor {
                 break;
             default:
                 throw new ClassFormatError("Not a valid annotation element type tag: 0x" +
-                    Integer.toHexString(tag));
+                        Integer.toHexString(tag));
         }
     }
 
@@ -744,9 +750,9 @@ public final class AnnotationDetector implements Builder, Cursor {
         final Object value = constantPool[index];
         final String s;
         if (value instanceof Integer) {
-            s = (String)constantPool[(Integer)value];
+            s = (String) constantPool[(Integer) value];
         } else {
-            s = (String)value;
+            s = (String) value;
         }
         return s;
     }
@@ -757,7 +763,7 @@ public final class AnnotationDetector implements Builder, Cursor {
      */
     // incorrect detection of dereferencing possible null pointer
     // TODO: https://github.com/checkstyle/checkstyle/issues/14 fixed in 5.8?
-    @SuppressWarnings({"null", "javancss" })
+    @SuppressWarnings({"null", "javancss"})
     private Class<?>[] parseArguments(final String descriptor) {
         final int n = descriptor.length();
         // "minimal" descriptor: no arguments: "()V", first character is always '('
@@ -771,7 +777,7 @@ public final class AnnotationDetector implements Builder, Cursor {
                 if (c == ')') {
                     return new Class<?>[0];
                 } else {
-                    args = new LinkedList<Class<?>>();
+                    args = new LinkedList<>();
                 }
             }
             assert args != null;
@@ -828,31 +834,6 @@ public final class AnnotationDetector implements Builder, Cursor {
             }
         }
         throw unparseable(descriptor, "No closing parenthesis");
-    }
-
-    /**
-     * Load the class, but do not initialize it.
-     */
-    private static Class<?> loadClass(ClassLoader loader, final String rawClassName) {
-        final String typeName = rawClassName.replace('/', '.');
-        try {
-            return Class.forName(typeName, false, loader);
-        } catch (ClassNotFoundException ex) {
-            throw assertionError(
-                "Cannot load type '%s', scanned file not on class path? (%s)", typeName, ex);
-        }
-    }
-
-    /**
-     * The method descriptor must always be parseable, so if not an AssertionError is thrown.
-     */
-    private static AssertionError unparseable(final String descriptor, final String cause) {
-        return assertionError(
-            "Unparseble method descriptor: '%s' (cause: %s)", descriptor, cause);
-    }
-
-    private static AssertionError assertionError(String message, Object... args) {
-        return new AssertionError(String.format(message, args));
     }
 
 }
